@@ -1960,21 +1960,31 @@ func buttonSendVariants(plan *buttonBuildPlan) []buttonSendVariant {
 	v1 := int32(1)
 	v2 := int32(2)
 	v3 := int32(3)
-	variants := []buttonSendVariant{
+	if plan.HasPix {
+		return []buttonSendVariant{
+			{Name: "native_v1_no_nodes", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true},
+			{Name: "native_v1_biz_only", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz"},
+			{Name: "native_v1_biz_bot", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz_bot"},
+		}
+	}
+	if plan.HasCTA {
+		return []buttonSendVariant{
+			{Name: "native_v1_no_nodes", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true},
+			{Name: "native_v1_biz_only", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz"},
+			{Name: "native_v1_biz_bot", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz_bot"},
+			{Name: "carousel_like_no_nodes"},
+			{Name: "carousel_like_v2_no_nodes", MessageVersion: &v2},
+			{Name: "carousel_like_v3_no_nodes", MessageVersion: &v3},
+		}
+	}
+	return []buttonSendVariant{
 		{Name: "view_once_v2_no_nodes", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true},
 		{Name: "view_once_v2_biz_only", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true, AdditionalNodesMode: "biz"},
 		{Name: "view_once_v2_biz_bot", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true, AdditionalNodesMode: "biz_bot"},
 		{Name: "carousel_like_no_nodes"},
 		{Name: "carousel_like_v2_no_nodes", MessageVersion: &v2},
 		{Name: "carousel_like_v3_no_nodes", MessageVersion: &v3},
-		{Name: "native_v1_no_nodes", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true},
-		{Name: "native_v1_biz_only", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz"},
-		{Name: "native_v1_biz_bot", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz_bot"},
 	}
-	if plan.HasPix {
-		return variants[6:]
-	}
-	return variants
 }
 
 func isWhatsApp405(err error) bool {
@@ -2142,6 +2152,9 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 	plan, err := validateButtonData(data)
 	if err != nil {
 		return nil, err
+	}
+	if plan.HasReply {
+		return nil, &ButtonValidationError{Message: "reply buttons are not supported by /send/button with the current WhatsApp/whatsmeow native-flow format because WhatsApp accepts the stanza but does not deliver a renderable message; use /send/carousel for reply buttons or /send/list for selectable replies"}
 	}
 
 	client, err := s.ensureClientConnected(instance.Id)
@@ -2675,12 +2688,6 @@ func (s *sendService) SendList(data *ListStruct, instance *instance_model.Instan
 				},
 			}},
 		},
-	}
-	if !strings.Contains(data.Number, "@g.us") {
-		listBizNodes = append(listBizNodes, waBinary.Node{
-			Tag:   "bot",
-			Attrs: waBinary.Attrs{"biz_bot": "1"},
-		})
 	}
 
 	message, err := s.SendMessage(instance, msg, "ListMessage", &SendDataStruct{

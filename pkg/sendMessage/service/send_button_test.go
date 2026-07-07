@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
@@ -179,12 +180,12 @@ func TestButtonDefaultPayloadUsesViewOnceNativeFlowShape(t *testing.T) {
 }
 
 func TestButtonFallbackVariantsCoverRequestedShapes(t *testing.T) {
-	plan, err := validateButtonData(testButtonPayload(validReplyButton("btn_ok")))
+	replyPlan, err := validateButtonData(testButtonPayload(validReplyButton("btn_ok")))
 	if err != nil {
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 
-	variants := buttonSendVariants(plan)
+	variants := buttonSendVariants(replyPlan)
 	var names []string
 	for _, variant := range variants {
 		names = append(names, variant.Name)
@@ -197,9 +198,6 @@ func TestButtonFallbackVariantsCoverRequestedShapes(t *testing.T) {
 		"carousel_like_no_nodes",
 		"carousel_like_v2_no_nodes",
 		"carousel_like_v3_no_nodes",
-		"native_v1_no_nodes",
-		"native_v1_biz_only",
-		"native_v1_biz_bot",
 	} {
 		found := false
 		for _, got := range names {
@@ -211,5 +209,30 @@ func TestButtonFallbackVariantsCoverRequestedShapes(t *testing.T) {
 		if !found {
 			t.Fatalf("missing fallback variant %q in %v", want, names)
 		}
+	}
+
+	ctaPlan, err := validateButtonData(testButtonPayload(validURLButton()))
+	if err != nil {
+		t.Fatalf("unexpected CTA validation error: %v", err)
+	}
+	ctaVariants := buttonSendVariants(ctaPlan)
+	if len(ctaVariants) < 3 {
+		t.Fatalf("expected CTA variants, got %v", ctaVariants)
+	}
+	for i, want := range []string{"native_v1_no_nodes", "native_v1_biz_only", "native_v1_biz_bot"} {
+		if got := ctaVariants[i].Name; got != want {
+			t.Fatalf("CTA variant %d got %q want %q", i, got, want)
+		}
+	}
+}
+
+func TestSendButtonReplyReturnsClearUnsupportedError(t *testing.T) {
+	service := &sendService{}
+	_, err := service.SendButton(testButtonPayload(validReplyButton("btn_ok")), &instance_model.Instance{Id: "test"})
+	if err == nil {
+		t.Fatal("expected reply button to return unsupported error")
+	}
+	if !strings.Contains(err.Error(), "reply buttons are not supported by /send/button") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
