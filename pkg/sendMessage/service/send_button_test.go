@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"google.golang.org/protobuf/proto"
 )
 
 func validReplyButton(id string) Button {
@@ -107,6 +110,92 @@ func TestBuildNativeFlowButtons(t *testing.T) {
 		}
 		if params["display_text"] == "" {
 			t.Fatalf("button %d missing display_text in params", i)
+		}
+	}
+}
+
+func TestButtonDefaultPayloadMatchesCarouselNativeFlowShape(t *testing.T) {
+	plan, err := validateButtonData(testButtonPayload(validReplyButton("btn_ok")))
+	if err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	variant := buttonSendVariants(plan)[0]
+	msg, err := buildButtonMessage(nil, testButtonPayload(validReplyButton("btn_ok")), plan, variant)
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+
+	nativeFlow := msg.GetInteractiveMessage().GetNativeFlowMessage()
+	if nativeFlow == nil {
+		t.Fatal("expected native flow message")
+	}
+	if nativeFlow.MessageParamsJSON != nil {
+		t.Fatalf("default button payload must not set MessageParamsJSON, got %q", nativeFlow.GetMessageParamsJSON())
+	}
+	if nativeFlow.MessageVersion != nil {
+		t.Fatalf("default button payload must not set MessageVersion, got %d", nativeFlow.GetMessageVersion())
+	}
+	if msg.GetMessageContextInfo().GetMessageSecret() != nil {
+		t.Fatal("default button payload must not set MessageSecret")
+	}
+	if nodes := buildButtonAdditionalNodes(testButtonPayload(validReplyButton("btn_ok")), plan, variant.AdditionalNodesMode); nodes != nil {
+		t.Fatalf("default button payload must not set AdditionalNodes, got %#v", nodes)
+	}
+
+	carouselCard := &waE2E.InteractiveMessage{
+		Body: &waE2E.InteractiveMessage_Body{Text: proto.String("Teste")},
+		Header: &waE2E.InteractiveMessage_Header{
+			Title:              proto.String("Teste"),
+			HasMediaAttachment: proto.Bool(false),
+		},
+		InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+				Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{{
+					Name:             proto.String("quick_reply"),
+					ButtonParamsJSON: proto.String(`{"display_text":"OK btn_ok","id":"btn_ok"}`),
+				}},
+			},
+		},
+	}
+	carouselNativeFlow := carouselCard.GetNativeFlowMessage()
+	if carouselNativeFlow.MessageParamsJSON != nil || carouselNativeFlow.MessageVersion != nil {
+		t.Fatal("test fixture should match carousel shape without native-flow params/version")
+	}
+	if nativeFlow.Buttons[0].GetName() != carouselNativeFlow.Buttons[0].GetName() {
+		t.Fatalf("button name mismatch: got %q want %q", nativeFlow.Buttons[0].GetName(), carouselNativeFlow.Buttons[0].GetName())
+	}
+}
+
+func TestButtonFallbackVariantsCoverRequestedShapes(t *testing.T) {
+	plan, err := validateButtonData(testButtonPayload(validReplyButton("btn_ok")))
+	if err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	variants := buttonSendVariants(plan)
+	var names []string
+	for _, variant := range variants {
+		names = append(names, variant.Name)
+	}
+
+	for _, want := range []string{
+		"carousel_like_no_nodes",
+		"carousel_like_v2_no_nodes",
+		"carousel_like_v3_no_nodes",
+		"native_v1_no_nodes",
+		"native_v1_biz_only",
+		"native_v1_biz_bot",
+	} {
+		found := false
+		for _, got := range names {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing fallback variant %q in %v", want, names)
 		}
 	}
 }

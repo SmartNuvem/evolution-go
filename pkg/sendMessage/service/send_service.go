@@ -1946,6 +1946,179 @@ func buttonMessageParamsJSON(plan *buttonBuildPlan) *string {
 	return proto.String(`{"from":"api","templateId":` + templateID + `}`)
 }
 
+type buttonSendVariant struct {
+	Name                 string
+	MessageVersion       *int32
+	UseMessageParamsJSON bool
+	UseMessageSecret     bool
+	AdditionalNodesMode  string
+}
+
+func buttonSendVariants(plan *buttonBuildPlan) []buttonSendVariant {
+	v1 := int32(1)
+	v2 := int32(2)
+	v3 := int32(3)
+	variants := []buttonSendVariant{
+		{Name: "carousel_like_no_nodes"},
+		{Name: "carousel_like_v2_no_nodes", MessageVersion: &v2},
+		{Name: "carousel_like_v3_no_nodes", MessageVersion: &v3},
+		{Name: "native_v1_no_nodes", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true},
+		{Name: "native_v1_biz_only", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz"},
+		{Name: "native_v1_biz_bot", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz_bot"},
+	}
+	if plan.HasPix {
+		return variants[3:]
+	}
+	return variants
+}
+
+func isWhatsApp405(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "405")
+}
+
+func buildButtonAdditionalNodes(data *ButtonStruct, plan *buttonBuildPlan, mode string) *[]waBinary.Node {
+	if mode == "" || mode == "none" {
+		return nil
+	}
+	bizInteractiveContent := waBinary.Node{
+		Tag:   "interactive",
+		Attrs: waBinary.Attrs{"type": "native_flow", "v": "1"},
+		Content: []waBinary.Node{{
+			Tag:   "native_flow",
+			Attrs: waBinary.Attrs{"name": plan.NativeFlowName},
+		}},
+	}
+	nodes := []waBinary.Node{{Tag: "biz", Content: []waBinary.Node{bizInteractiveContent}}}
+	if mode == "biz_bot" && !strings.Contains(data.Number, "@g.us") {
+		nodes = append(nodes, waBinary.Node{Tag: "bot", Attrs: waBinary.Attrs{"biz_bot": "1"}})
+	}
+	return &nodes
+}
+
+func buildButtonMessage(client *whatsmeow.Client, data *ButtonStruct, plan *buttonBuildPlan, variant buttonSendVariant) (*waE2E.Message, error) {
+	buttons, err := buildNativeFlowButtons(plan)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build button payload: %w", err)
+	}
+
+	nativeFlow := &waE2E.InteractiveMessage_NativeFlowMessage{Buttons: buttons}
+	if variant.UseMessageParamsJSON {
+		nativeFlow.MessageParamsJSON = buttonMessageParamsJSON(plan)
+	}
+	if variant.MessageVersion != nil {
+		nativeFlow.MessageVersion = proto.Int32(*variant.MessageVersion)
+	}
+
+	interactiveMsg := &waE2E.InteractiveMessage{
+		Header: &waE2E.InteractiveMessage_Header{
+			Title:              proto.String(data.Title),
+			HasMediaAttachment: proto.Bool(false),
+		},
+		Body:        &waE2E.InteractiveMessage_Body{Text: proto.String(data.Description)},
+		Footer:      &waE2E.InteractiveMessage_Footer{Text: proto.String(data.Footer)},
+		ContextInfo: &waE2E.ContextInfo{},
+		InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+			NativeFlowMessage: nativeFlow,
+		},
+	}
+
+	if client != nil && plan.HasReply && !plan.HasCTA && !plan.HasPix {
+		if data.ImageUrl != "" {
+			if resp, err := http.Get(data.ImageUrl); err == nil {
+				fileData, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr == nil {
+					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaImage); upErr == nil {
+						interactiveMsg.Header.HasMediaAttachment = proto.Bool(true)
+						interactiveMsg.Header.Media = &waE2E.InteractiveMessage_Header_ImageMessage{
+							ImageMessage: &waE2E.ImageMessage{
+								URL:           proto.String(uploaded.URL),
+								DirectPath:    proto.String(uploaded.DirectPath),
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      proto.String("image/jpeg"),
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    proto.Uint64(uint64(len(fileData))),
+								JPEGThumbnail: makeJPEGThumbnail(fileData, 72),
+							},
+						}
+					}
+				}
+			}
+		} else if data.VideoUrl != "" {
+			if resp, err := http.Get(data.VideoUrl); err == nil {
+				fileData, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr == nil {
+					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo); upErr == nil {
+						interactiveMsg.Header.HasMediaAttachment = proto.Bool(true)
+						interactiveMsg.Header.Media = &waE2E.InteractiveMessage_Header_VideoMessage{
+							VideoMessage: &waE2E.VideoMessage{
+								URL:           proto.String(uploaded.URL),
+								DirectPath:    proto.String(uploaded.DirectPath),
+								MediaKey:      uploaded.MediaKey,
+								Mimetype:      proto.String("video/mp4"),
+								FileEncSHA256: uploaded.FileEncSHA256,
+								FileSHA256:    uploaded.FileSHA256,
+								FileLength:    proto.Uint64(uint64(len(fileData))),
+							},
+						}
+					}
+				}
+			}
+		}
+	}
+
+	messageContextInfo := &waE2E.MessageContextInfo{DeviceListMetadata: &waE2E.DeviceListMetadata{}}
+	if variant.UseMessageSecret {
+		btnMsgSecret := make([]byte, 32)
+		_, _ = crypto_rand.Read(btnMsgSecret)
+		messageContextInfo.MessageSecret = btnMsgSecret
+	}
+
+	return &waE2E.Message{
+		InteractiveMessage: interactiveMsg,
+		MessageContextInfo: messageContextInfo,
+	}, nil
+}
+
+func (s *sendService) sendButtonWithVariants(data *ButtonStruct, instance *instance_model.Instance, client *whatsmeow.Client, plan *buttonBuildPlan) (*MessageSendStruct, error) {
+	var lastErr error
+	var attempts []string
+	for _, variant := range buttonSendVariants(plan) {
+		msg, err := buildButtonMessage(client, data, plan, variant)
+		if err != nil {
+			return nil, err
+		}
+		additionalNodes := buildButtonAdditionalNodes(data, plan, variant.AdditionalNodesMode)
+		msgJSON, _ := json.Marshal(msg)
+		nodesJSON, _ := json.Marshal(additionalNodes)
+		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendButton attempt=%s nativeFlow=%s payload=%s nodes=%s", instance.Id, variant.Name, plan.NativeFlowName, string(msgJSON), string(nodesJSON))
+		message, err := s.SendMessage(instance, msg, "InteractiveMessage", &SendDataStruct{
+			Number:          data.Number,
+			Delay:           data.Delay,
+			MentionAll:      data.MentionAll,
+			MentionedJID:    data.MentionedJID,
+			FormatJid:       data.FormatJid,
+			Quoted:          data.Quoted,
+			AdditionalNodes: additionalNodes,
+		})
+		if err == nil {
+			return message, nil
+		}
+		lastErr = err
+		attempts = append(attempts, fmt.Sprintf("%s: %v", variant.Name, err))
+		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] SendButton attempt=%s failed: %v", instance.Id, variant.Name, err)
+		if !isWhatsApp405(err) {
+			return nil, err
+		}
+	}
+	if plan.HasReply {
+		return nil, fmt.Errorf("WhatsApp rejected reply buttons with error 405 after attempts (%s). Current WhatsApp/whatsmeow combination may not support /send/button reply buttons in this format; use /send/list, /send/carousel, or CTA buttons as a fallback: %w", strings.Join(attempts, " | "), lastErr)
+	}
+	return nil, fmt.Errorf("WhatsApp rejected button message after attempts (%s): %w", strings.Join(attempts, " | "), lastErr)
+}
+
 func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
 	plan, err := validateButtonData(data)
 	if err != nil {
@@ -1957,6 +2130,8 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		return nil, err
 	}
 	data.Buttons = plan.Buttons
+
+	return s.sendButtonWithVariants(data, instance, client, plan)
 
 	hasReply := false
 	hasPix := false
