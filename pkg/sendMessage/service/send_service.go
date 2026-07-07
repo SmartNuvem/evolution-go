@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -1733,11 +1734,229 @@ func mapKeyType(keyType string) string {
 	}
 }
 
+type ButtonValidationError struct {
+	Message string
+}
+
+func (e *ButtonValidationError) Error() string {
+	return e.Message
+}
+
+type buttonBuildPlan struct {
+	Buttons        []Button
+	HasReply       bool
+	HasPix         bool
+	HasCTA         bool
+	NativeFlowName string
+}
+
+func validateButtonData(data *ButtonStruct) (*buttonBuildPlan, error) {
+	if data == nil {
+		return nil, &ButtonValidationError{Message: "payload is required"}
+	}
+	if len(data.Buttons) == 0 {
+		return nil, &ButtonValidationError{Message: "at least one button is required"}
+	}
+
+	plan := &buttonBuildPlan{Buttons: make([]Button, 0, len(data.Buttons))}
+	replyCount := 0
+
+	for i, rawButton := range data.Buttons {
+		button := rawButton
+		button.Type = strings.ToLower(strings.TrimSpace(button.Type))
+		if button.Type == "" {
+			button.Type = "reply"
+		}
+		button.DisplayText = strings.TrimSpace(button.DisplayText)
+		button.Id = strings.TrimSpace(button.Id)
+		button.CopyCode = strings.TrimSpace(button.CopyCode)
+		button.URL = strings.TrimSpace(button.URL)
+		button.PhoneNumber = strings.TrimSpace(button.PhoneNumber)
+		button.Currency = strings.ToUpper(strings.TrimSpace(button.Currency))
+		button.Name = strings.TrimSpace(button.Name)
+		button.KeyType = strings.ToLower(strings.TrimSpace(button.KeyType))
+		button.Key = strings.TrimSpace(button.Key)
+
+		fieldPrefix := fmt.Sprintf("buttons[%d]", i)
+		switch button.Type {
+		case "reply":
+			plan.HasReply = true
+			replyCount++
+			if button.DisplayText == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".displayText is required for reply buttons"}
+			}
+			if button.Id == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".id is required for reply buttons"}
+			}
+		case "copy":
+			plan.HasCTA = true
+			if button.DisplayText == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".displayText is required for copy buttons"}
+			}
+			if button.CopyCode == "" {
+				button.CopyCode = button.Id
+			}
+			if button.CopyCode == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".copyCode is required for copy buttons"}
+			}
+			if button.Id == "" {
+				button.Id = "copy_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+			}
+		case "url":
+			plan.HasCTA = true
+			if button.DisplayText == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".displayText is required for url buttons"}
+			}
+			if button.URL == "" {
+				button.URL = button.Id
+			}
+			if button.URL == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".url is required for url buttons"}
+			}
+		case "call":
+			plan.HasCTA = true
+			if button.DisplayText == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".displayText is required for call buttons"}
+			}
+			if button.PhoneNumber == "" {
+				button.PhoneNumber = button.Id
+			}
+			if button.PhoneNumber == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".phoneNumber is required for call buttons"}
+			}
+		case "pix":
+			plan.HasPix = true
+			if button.Currency == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".currency is required for pix buttons"}
+			}
+			if button.Name == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".name is required for pix buttons"}
+			}
+			if button.KeyType == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".keyType is required for pix buttons"}
+			}
+			if button.Key == "" {
+				return nil, &ButtonValidationError{Message: fieldPrefix + ".key is required for pix buttons"}
+			}
+		default:
+			return nil, &ButtonValidationError{Message: fieldPrefix + ".type must be one of: reply, copy, url, call, pix"}
+		}
+
+		plan.Buttons = append(plan.Buttons, button)
+	}
+
+	if plan.HasReply {
+		if replyCount > 3 {
+			return nil, &ButtonValidationError{Message: "maximum of 3 reply buttons is allowed"}
+		}
+		if plan.HasCTA || plan.HasPix {
+			return nil, &ButtonValidationError{Message: "reply buttons cannot be mixed with copy, url, call or pix buttons"}
+		}
+		plan.NativeFlowName = "quick_reply"
+	}
+
+	if plan.HasPix {
+		if len(plan.Buttons) > 1 {
+			return nil, &ButtonValidationError{Message: "pix button cannot be combined with other buttons"}
+		}
+		plan.NativeFlowName = "payment_info"
+	}
+
+	if plan.HasCTA && !plan.HasReply && !plan.HasPix {
+		plan.NativeFlowName = "mixed"
+	}
+
+	return plan, nil
+}
+
+func buildNativeFlowButtons(plan *buttonBuildPlan) ([]*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton, error) {
+	buttons := make([]*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton, 0, len(plan.Buttons))
+
+	for _, button := range plan.Buttons {
+		var name string
+		var payload interface{}
+
+		switch button.Type {
+		case "reply":
+			name = "quick_reply"
+			payload = map[string]string{"display_text": button.DisplayText, "id": button.Id}
+		case "copy":
+			name = "cta_copy"
+			payload = map[string]string{"display_text": button.DisplayText, "id": button.Id, "copy_code": button.CopyCode}
+		case "url":
+			name = "cta_url"
+			payload = map[string]string{"display_text": button.DisplayText, "url": button.URL, "merchant_url": button.URL}
+		case "call":
+			name = "cta_call"
+			payload = map[string]string{"display_text": button.DisplayText, "phone_number": button.PhoneNumber}
+		case "pix":
+			name = "payment_info"
+			payload = map[string]interface{}{
+				"currency":     button.Currency,
+				"total_amount": map[string]interface{}{"value": 0, "offset": 100},
+				"reference_id": utils.GenerateRandomString(11),
+				"type":         "physical-goods",
+				"order": map[string]interface{}{
+					"status":     "pending",
+					"subtotal":   map[string]interface{}{"value": 0, "offset": 100},
+					"order_type": "ORDER",
+					"items": []map[string]interface{}{
+						{
+							"name":        "",
+							"amount":      map[string]interface{}{"value": 0, "offset": 100},
+							"quantity":    0,
+							"sale_amount": map[string]interface{}{"value": 0, "offset": 100},
+						},
+					},
+				},
+				"payment_settings": []map[string]interface{}{
+					{
+						"type": "pix_static_code",
+						"pix_static_code": map[string]string{
+							"merchant_name": button.Name,
+							"key":           button.Key,
+							"key_type":      mapKeyType(button.KeyType),
+						},
+					},
+				},
+				"share_payment_status": false,
+			}
+		}
+
+		jsonBytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+
+		buttons = append(buttons, &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+			Name:             proto.String(name),
+			ButtonParamsJSON: proto.String(string(jsonBytes)),
+		})
+	}
+
+	return buttons, nil
+}
+
+func buttonMessageParamsJSON(plan *buttonBuildPlan) *string {
+	if plan.HasPix {
+		return proto.String(`{"native_flow_name":"order_details","version":1}`)
+	}
+
+	templateID := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
+	return proto.String(`{"from":"api","templateId":` + templateID + `}`)
+}
+
 func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
+	plan, err := validateButtonData(data)
+	if err != nil {
+		return nil, err
+	}
+
 	client, err := s.ensureClientConnected(instance.Id)
 	if err != nil {
 		return nil, err
 	}
+	data.Buttons = plan.Buttons
 
 	hasReply := false
 	hasPix := false
@@ -1845,45 +2064,46 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 		})
 	}
 
-	templateId := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
-	messageParamsJSON := `{"from":"api","templateId":` + templateId + `}`
-
 	// MessageSecret (32 random bytes) — required for iOS to render interactive messages.
+	buttons, err = buildNativeFlowButtons(plan)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build button payload: %w", err)
+	}
+
 	btnMsgSecret := make([]byte, 32)
 	_, _ = crypto_rand.Read(btnMsgSecret)
 
-	var msg *waE2E.Message
-	var msgType string
+	interactiveMsg := &waE2E.InteractiveMessage{
+		Header: &waE2E.InteractiveMessage_Header{
+			Title:              proto.String(data.Title),
+			HasMediaAttachment: proto.Bool(false),
+		},
+		Body: &waE2E.InteractiveMessage_Body{
+			Text: proto.String(data.Description),
+		},
+		Footer: &waE2E.InteractiveMessage_Footer{
+			Text: proto.String(data.Footer),
+		},
+		ContextInfo: &waE2E.ContextInfo{},
+		InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+				Buttons:           buttons,
+				MessageParamsJSON: buttonMessageParamsJSON(plan),
+				MessageVersion:    proto.Int32(1),
+			},
+		},
+	}
 
-	if hasReply && !hasOtherTypes && !hasPix {
-		// Reply-only: native ButtonsMessage wrapped in DocumentWithCaptionMessage (Baileys PR #36).
-		var replyButtons []*waE2E.ButtonsMessage_Button
-		for _, v := range data.Buttons {
-			replyButtons = append(replyButtons, &waE2E.ButtonsMessage_Button{
-				ButtonID: proto.String(v.Id),
-				ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
-					DisplayText: proto.String(v.DisplayText),
-				},
-				Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
-			})
-		}
-
-		buttonsMsg := &waE2E.ButtonsMessage{
-			ContentText: proto.String(data.Description),
-			FooterText:  proto.String(data.Footer),
-			HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
-			Buttons:     replyButtons,
-		}
-
-		// Optional media header (image or video URL).
+	// Optional media header is kept for reply-only buttons, matching the previous public contract.
+	if plan.HasReply && !plan.HasCTA && !plan.HasPix {
 		if data.ImageUrl != "" {
 			if resp, err := http.Get(data.ImageUrl); err == nil {
 				fileData, readErr := io.ReadAll(resp.Body)
 				resp.Body.Close()
 				if readErr == nil {
 					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaImage); upErr == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_IMAGE.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
+						interactiveMsg.Header.HasMediaAttachment = proto.Bool(true)
+						interactiveMsg.Header.Media = &waE2E.InteractiveMessage_Header_ImageMessage{
 							ImageMessage: &waE2E.ImageMessage{
 								URL:           proto.String(uploaded.URL),
 								DirectPath:    proto.String(uploaded.DirectPath),
@@ -1892,6 +2112,7 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 								FileEncSHA256: uploaded.FileEncSHA256,
 								FileSHA256:    uploaded.FileSHA256,
 								FileLength:    proto.Uint64(uint64(len(fileData))),
+								JPEGThumbnail: makeJPEGThumbnail(fileData, 72),
 							},
 						}
 					}
@@ -1903,8 +2124,8 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 				resp.Body.Close()
 				if readErr == nil {
 					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaVideo); upErr == nil {
-						buttonsMsg.HeaderType = waE2E.ButtonsMessage_VIDEO.Enum()
-						buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
+						interactiveMsg.Header.HasMediaAttachment = proto.Bool(true)
+						interactiveMsg.Header.Media = &waE2E.InteractiveMessage_Header_VideoMessage{
 							VideoMessage: &waE2E.VideoMessage{
 								URL:           proto.String(uploaded.URL),
 								DirectPath:    proto.String(uploaded.DirectPath),
@@ -1919,84 +2140,16 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 				}
 			}
 		}
-
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					ButtonsMessage: buttonsMsg,
-				},
-			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
-		}
-		msgType = "ButtonsMessage"
-	} else if hasPix {
-		// Pix: NativeFlowMessage wrapped in DocumentWithCaptionMessage.
-		paymentMsgParams := `{"native_flow_name":"order_details","version":1}`
-
-		var interactiveBody *waE2E.InteractiveMessage_Body
-		if data.Title != "" {
-			bodyText := data.Title
-			interactiveBody = &waE2E.InteractiveMessage_Body{Text: &bodyText}
-		}
-
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: &waE2E.InteractiveMessage{
-						Body: interactiveBody,
-						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-								Buttons:           buttons,
-								MessageParamsJSON: &paymentMsgParams,
-								MessageVersion:    proto.Int32(1),
-							},
-						},
-					},
-				},
-			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
-		}
-		msgType = "InteractiveMessage"
-	} else {
-		// Mixed CTA buttons (url/copy/call): NativeFlowMessage wrapped in DocumentWithCaptionMessage.
-		body := func() string {
-			t := "*" + data.Title + "*"
-			if data.Description != "" {
-				t += "\n\n" + data.Description + "\n"
-			}
-			return t
-		}()
-
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: &waE2E.InteractiveMessage{
-						Body: &waE2E.InteractiveMessage_Body{
-							Text: &body,
-						},
-						Footer: &waE2E.InteractiveMessage_Footer{
-							Text: &data.Footer,
-						},
-						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-								Buttons:           buttons,
-								MessageParamsJSON: &messageParamsJSON,
-								MessageVersion:    proto.Int32(1),
-							},
-						},
-					},
-				},
-			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
-		}
-		msgType = "InteractiveMessage"
 	}
+
+	msg := &waE2E.Message{
+		InteractiveMessage: interactiveMsg,
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			DeviceListMetadata: &waE2E.DeviceListMetadata{},
+			MessageSecret:      btnMsgSecret,
+		},
+	}
+	msgType := "InteractiveMessage"
 
 	// Build biz/bot nodes injected directly in the XMPP stanza — required for mobile rendering.
 	// Reply-only buttons get <biz><buttons/></biz>; CTA/Pix get <biz><interactive type="native_flow" v="1"><native_flow name="X"/></interactive></biz>.
@@ -2012,7 +2165,7 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			Content: []waBinary.Node{{
 				Tag: "native_flow",
 				Attrs: waBinary.Attrs{
-					"name": "quick_reply",
+					"name": plan.NativeFlowName,
 				},
 			}},
 		}
@@ -2026,7 +2179,7 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			Content: []waBinary.Node{{
 				Tag: "native_flow",
 				Attrs: waBinary.Attrs{
-					"name": "payment_info",
+					"name": plan.NativeFlowName,
 				},
 			}},
 		}
@@ -2041,7 +2194,7 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			Content: []waBinary.Node{{
 				Tag: "native_flow",
 				Attrs: waBinary.Attrs{
-					"name": "mixed",
+					"name": plan.NativeFlowName,
 				},
 			}},
 		}
@@ -2059,6 +2212,14 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			Attrs: waBinary.Attrs{"biz_bot": "1"},
 		})
 	}
+
+	msgJSON, _ := json.Marshal(msg)
+	nodesJSON, _ := json.Marshal(bizNodes)
+	receivedJSON, _ := json.Marshal(data)
+	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendButton received payload: %s", instance.Id, string(receivedJSON))
+	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendButton button types: reply=%t cta=%t pix=%t nativeFlow=%s count=%d", instance.Id, plan.HasReply, plan.HasCTA, plan.HasPix, plan.NativeFlowName, len(plan.Buttons))
+	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendButton InteractiveMessage payload: %s", instance.Id, string(msgJSON))
+	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendButton AdditionalNodes payload: %s", instance.Id, string(nodesJSON))
 
 	// Route through centralized SendMessage for ContextInfo, webhooks, quotes, mentions.
 	message, err := s.SendMessage(instance, msg, msgType, &SendDataStruct{
@@ -2772,11 +2933,14 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 
 	response, err := s.clientPointer[instance.Id].SendMessage(context.Background(), recipient, msg, sendExtra)
 	if err != nil {
-		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending message: %v", instance.Id, err)
+		msgJSON, _ := json.Marshal(msg)
+		extraJSON, _ := json.Marshal(sendExtra)
+		s.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error sending message via whatsmeow. recipient=%s messageType=%s error=%+v payload=%s extra=%s stack=%s", instance.Id, recipient.String(), messageType, err, string(msgJSON), string(extraJSON), string(debug.Stack()))
 		return nil, err
 	}
 
-	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Message sent successfully! ServerID: %d", instance.Id, response.ServerID)
+	responseJSON, _ := json.Marshal(response)
+	s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Message sent successfully! Response: %s", instance.Id, string(responseJSON))
 
 	messageInfo := types.MessageInfo{
 		MessageSource: types.MessageSource{

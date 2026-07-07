@@ -2,8 +2,10 @@ package send_handler
 
 import (
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -552,6 +554,12 @@ func (s *sendHandler) SendButton(ctx *gin.Context) {
 
 	message, err := s.sendMessageService.SendButton(data, instance)
 	if err != nil {
+		var validationErr *send_service.ButtonValidationError
+		if errors.As(err, &validationErr) {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
+			return
+		}
+		debug.PrintStack()
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
