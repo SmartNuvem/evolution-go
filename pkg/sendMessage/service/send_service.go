@@ -1947,11 +1947,13 @@ func buttonMessageParamsJSON(plan *buttonBuildPlan) *string {
 }
 
 type buttonSendVariant struct {
-	Name                 string
-	MessageVersion       *int32
-	UseMessageParamsJSON bool
-	UseMessageSecret     bool
-	AdditionalNodesMode  string
+	Name                      string
+	MessageVersion            *int32
+	DeviceListMetadataVersion *int32
+	UseMessageParamsJSON      bool
+	UseMessageSecret          bool
+	UseViewOnceEnvelope       bool
+	AdditionalNodesMode       string
 }
 
 func buttonSendVariants(plan *buttonBuildPlan) []buttonSendVariant {
@@ -1959,6 +1961,9 @@ func buttonSendVariants(plan *buttonBuildPlan) []buttonSendVariant {
 	v2 := int32(2)
 	v3 := int32(3)
 	variants := []buttonSendVariant{
+		{Name: "view_once_v2_no_nodes", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true},
+		{Name: "view_once_v2_biz_only", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true, AdditionalNodesMode: "biz"},
+		{Name: "view_once_v2_biz_bot", DeviceListMetadataVersion: &v2, UseViewOnceEnvelope: true, AdditionalNodesMode: "biz_bot"},
 		{Name: "carousel_like_no_nodes"},
 		{Name: "carousel_like_v2_no_nodes", MessageVersion: &v2},
 		{Name: "carousel_like_v3_no_nodes", MessageVersion: &v3},
@@ -1967,7 +1972,7 @@ func buttonSendVariants(plan *buttonBuildPlan) []buttonSendVariant {
 		{Name: "native_v1_biz_bot", MessageVersion: &v1, UseMessageParamsJSON: true, UseMessageSecret: true, AdditionalNodesMode: "biz_bot"},
 	}
 	if plan.HasPix {
-		return variants[3:]
+		return variants[6:]
 	}
 	return variants
 }
@@ -2070,10 +2075,24 @@ func buildButtonMessage(client *whatsmeow.Client, data *ButtonStruct, plan *butt
 	}
 
 	messageContextInfo := &waE2E.MessageContextInfo{DeviceListMetadata: &waE2E.DeviceListMetadata{}}
+	if variant.DeviceListMetadataVersion != nil {
+		messageContextInfo.DeviceListMetadataVersion = proto.Int32(*variant.DeviceListMetadataVersion)
+	}
 	if variant.UseMessageSecret {
 		btnMsgSecret := make([]byte, 32)
 		_, _ = crypto_rand.Read(btnMsgSecret)
 		messageContextInfo.MessageSecret = btnMsgSecret
+	}
+
+	if variant.UseViewOnceEnvelope {
+		return &waE2E.Message{
+			ViewOnceMessage: &waE2E.FutureProofMessage{
+				Message: &waE2E.Message{
+					MessageContextInfo: messageContextInfo,
+					InteractiveMessage: interactiveMsg,
+				},
+			},
+		}, nil
 	}
 
 	return &waE2E.Message{

@@ -114,7 +114,7 @@ func TestBuildNativeFlowButtons(t *testing.T) {
 	}
 }
 
-func TestButtonDefaultPayloadMatchesCarouselNativeFlowShape(t *testing.T) {
+func TestButtonDefaultPayloadUsesViewOnceNativeFlowShape(t *testing.T) {
 	plan, err := validateButtonData(testButtonPayload(validReplyButton("btn_ok")))
 	if err != nil {
 		t.Fatalf("unexpected validation error: %v", err)
@@ -126,7 +126,18 @@ func TestButtonDefaultPayloadMatchesCarouselNativeFlowShape(t *testing.T) {
 		t.Fatalf("unexpected build error: %v", err)
 	}
 
-	nativeFlow := msg.GetInteractiveMessage().GetNativeFlowMessage()
+	innerMsg := msg.GetViewOnceMessage().GetMessage()
+	if innerMsg == nil {
+		t.Fatal("expected default button payload to use viewOnceMessage envelope")
+	}
+	if msg.GetInteractiveMessage() != nil {
+		t.Fatal("default button payload must not use top-level InteractiveMessage")
+	}
+	if got := innerMsg.GetMessageContextInfo().GetDeviceListMetadataVersion(); got != 2 {
+		t.Fatalf("expected deviceListMetadataVersion 2 in viewOnce envelope, got %d", got)
+	}
+
+	nativeFlow := innerMsg.GetInteractiveMessage().GetNativeFlowMessage()
 	if nativeFlow == nil {
 		t.Fatal("expected native flow message")
 	}
@@ -136,7 +147,7 @@ func TestButtonDefaultPayloadMatchesCarouselNativeFlowShape(t *testing.T) {
 	if nativeFlow.MessageVersion != nil {
 		t.Fatalf("default button payload must not set MessageVersion, got %d", nativeFlow.GetMessageVersion())
 	}
-	if msg.GetMessageContextInfo().GetMessageSecret() != nil {
+	if innerMsg.GetMessageContextInfo().GetMessageSecret() != nil {
 		t.Fatal("default button payload must not set MessageSecret")
 	}
 	if nodes := buildButtonAdditionalNodes(testButtonPayload(validReplyButton("btn_ok")), plan, variant.AdditionalNodesMode); nodes != nil {
@@ -180,6 +191,9 @@ func TestButtonFallbackVariantsCoverRequestedShapes(t *testing.T) {
 	}
 
 	for _, want := range []string{
+		"view_once_v2_no_nodes",
+		"view_once_v2_biz_only",
+		"view_once_v2_biz_bot",
 		"carousel_like_no_nodes",
 		"carousel_like_v2_no_nodes",
 		"carousel_like_v3_no_nodes",
